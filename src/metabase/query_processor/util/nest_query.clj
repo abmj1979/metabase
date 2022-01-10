@@ -12,7 +12,8 @@
             [metabase.query-processor.store :as qp.store]
             [metabase.query-processor.util.add-alias-info :as add]
             [metabase.util :as u]
-            [metabase.util.i18n :refer [tru]]))
+            [metabase.util.i18n :refer [tru]]
+            [medley.core :as m]))
 
 (defn- joined-fields [inner-query]
   (into #{} (mbql.u/match (dissoc inner-query :source-query :source-metadata)
@@ -22,7 +23,7 @@
 (defn- add-joined-fields-to-fields [joined-fields source]
   (cond-> source
     (seq joined-fields) (update :fields (fn [fields]
-                                          (distinct (concat fields joined-fields))))))
+                                          (m/distinct-by add/normalize-clause (concat fields joined-fields))))))
 
 (defn- nest-source [inner-query]
   (classloader/require 'metabase.query-processor)
@@ -30,6 +31,7 @@
                  ((resolve 'metabase.query-processor/query->preprocessed) {:database (u/the-id (qp.store/database))
                                                                            :type     :query
                                                                            :query    source})
+                 (add/add-alias-info source)
                  (:query source)
                  (dissoc source :limit)
                  (add-joined-fields-to-fields (joined-fields inner-query) source))]
@@ -40,29 +42,44 @@
 (defn- raise-source-query-expression-ref
   "Convert an `:expression` reference from a source query into an appropriate `:field` clause for use in the surrounding
   query."
-  [{:keys [expressions], :as source-query} [_ expression-name opts]]
-  (let [expression-definition (or (get expressions (keyword expression-name))
-                                  (throw (ex-info (tru "No expression named {0}" (pr-str expression-name))
-                                                  {:type            qp.error-type/invalid-query
-                                                   :expression-name expression-name
-                                                   :query           source-query})))
-        {base-type :base_type} (some-> expression-definition annotate/infer-expression-type)]
-    [:field expression-name (assoc opts :base-type (or base-type :type/*))]))
+  [{:keys [expressions source-query], :as query} [_ expression-name opts :as clause]]
+  (let [expression-definition        (or (get expressions (keyword expression-name))
+                                         (throw (ex-info (tru "No expression named {0}" (pr-str expression-name))
+                                                         {:type            qp.error-type/invalid-query
+                                                          :expression-name expression-name
+                                                          :query           query})))
+        {base-type :base_type}       (some-> expression-definition annotate/infer-expression-type)
+        {::add/keys [desired-alias]} (mbql.u/match-one source-query
+                                       [:expression (_ :guard (partial = expression-name)) source-opts]
+                                       source-opts)]
+    [:field
+     (or desired-alias expression-name)
+     (assoc opts :base-type (or base-type :type/*))]))
 
 (defn- rewrite-fields-and-expressions [query]
   (mbql.u/replace query
+    ;; don't rewrite anything inside any source queries or source metadata.
+    (_ :guard (constantly (some (partial contains? (set &parents))
+                                [:source-query :source-metadata])))
+    &match
+
     :expression
     (raise-source-query-expression-ref query &match)
 
     ;; mark all Fields at the new top level as `::outer-select` so QP implementations know not to apply coercion or
     ;; whatever to them a second time.
-    [:field _id-or-name (_opts :guard :temporal-unit)]
-    (mbql.u/update-field-options &match assoc ::outer-select true)
+    [:field _id-or-name (_opts :guard (every-pred :temporal-unit (complement ::outer-select)))]
+    (recur (mbql.u/update-field-options &match assoc ::outer-select true))
 
-    ;; [:field id-or-name (opts :guard :join-alias)]
-    ;; (let [{field-alias :alias} (refs/field-ref-info query &match)]
-    ;;   (assert field-alias)
-    ;;   [:field field-alias {:base-type :type/Integer}])
+    [:field id-or-name (opts :guard :join-alias)]
+    (let [{::add/keys [desired-alias]} (mbql.u/match-one (:source-query query)
+                                         [:field
+                                          (_ :guard (partial = id-or-name))
+                                          (matching-opts :guard #(= (:join-alias %) (:join-alias opts)))]
+                                         matching-opts)]
+      [:field id-or-name (cond-> opts
+                           desired-alias (assoc ::add/source-alias desired-alias
+                                                ::add/desired-alias desired-alias))])
 
     ;; when recursing into joins use the refs from the parent level.
     (m :guard (every-pred map? :joins))
@@ -71,14 +88,7 @@
           rewrite-fields-and-expressions
           (assoc :joins (mapv (fn [join]
                                 (assoc join :qp/refs (:qp/refs query)))
-                              joins))))
-
-    ;; don't recurse into any `:source-query` maps.
-    (m :guard (every-pred map? :source-query))
-    (let [{:keys [source-query]} m]
-      (-> (dissoc m :source-query)
-          rewrite-fields-and-expressions
-          (assoc :source-query source-query)))))
+                              joins))))))
 
 (defn nest-expressions
   "Pushes the `:source-table`/`:source-query`, `:expressions`, and `:joins` in the top-level of the query into a
@@ -87,8 +97,8 @@
   [{:keys [expressions], :as query}]
   (if (empty? expressions)
     query
-    (let [query                             (rewrite-fields-and-expressions query)
-          {:keys [source-query], :as query} (nest-source query)
+    (let [{:keys [source-query], :as query} (nest-source query)
+          query                             (rewrite-fields-and-expressions query)
           source-query                      (assoc source-query :expressions expressions)]
       (-> query
           (dissoc :source-query :expressions)

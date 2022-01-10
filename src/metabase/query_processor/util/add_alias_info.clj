@@ -87,28 +87,33 @@
 (defn- add-alias-info* [{:keys [source-table joins], aggregations :aggregation, :as inner-query}]
   (assert (not (:strategy inner-query)))
   (let [this-level-joins (into #{} (map :alias) joins)
-        clause->position (comp (selected-clauses inner-query) normalize-clause)]
-    #_(println "(u/pprint-to-str 'yellow inner-query):" (metabase.util/pprint-to-str 'yellow (dissoc inner-query :source-query :source-metadata))) ; NOCOMMIT
+        clause->position (comp (selected-clauses inner-query) normalize-clause)
+        unique-name      (mbql.u/unique-name-generator)
+        position->alias* (atom {})
+        position->alias  (fn [position original-alias]
+                           (or (get @position->alias* position)
+                               (let [unique-alias (unique-name original-alias)]
+                                 (swap! position->alias* assoc position unique-alias)
+                                 unique-alias)))]
     (mbql.u/replace inner-query
       ;; don't rewrite anything inside any source queries or source metadata.
       (_ :guard (constantly (some (partial contains? (set &parents))
                                   [:source-query :source-metadata])))
       &match
 
-      ;; TODO -- what about joins against native queries? I think we need to have `join-is-this-level?` logic like
-      ;; below.
-      [:field (field-name :guard string?) opts]
-      [:field field-name (merge opts
-                                {::source-table ::source
-                                 ::source-alias field-name}
-                                (when-let [position (clause->position &match)]
-                                  {::desired-alias field-name
-                                   ::position      position}))]
+      ;; [:field (field-name :guard string?) opts]
+      ;; [:field field-name (merge opts
+      ;;                           {::source-table ::source
+      ;;                            ::source-alias field-name}
+      ;;                           (when-let [position (clause->position &match)]
+      ;;                             {::desired-alias (position->alias position field-name)
+      ;;                              ::position      position}))]
 
       [:field id-or-name opts]
       (let [field                       (when (integer? id-or-name)
                                           (qp.store/field id-or-name))
-            field-name                  (or (:name field)
+            field-name                  (or #_(::source-alias opts)
+                                            (:name field)
                                             (when (string? id-or-name)
                                               id-or-name))
             table-id                    (:table_id field)
@@ -117,24 +122,22 @@
             matching-join-source-clause (matching-join-source-clause inner-query &match)
             join-desired-alias          (some-> matching-join-source-clause clause-options ::desired-alias)
             table                       (cond
-                                          (= table-id source-table) table-id
-                                          join-is-this-level?       join-alias
-                                          :else                     ::source)
+                                          join-is-this-level?                      join-alias
+                                          (and table-id (= table-id source-table)) table-id
+                                          :else                                    ::source)
             source-alias                (cond
                                           (and join-alias (not join-is-this-level?))   (format "%s__%s" join-alias field-name)
                                           (and join-is-this-level? join-desired-alias) join-desired-alias
                                           :else                                        field-name)
             desired-alias               (if join-alias
-                                          (format "%s__%s" join-alias field-name)
+                                          (format "%s__%s" join-alias (or join-desired-alias field-name))
                                           field-name)]
-        (u/prog1 [:field id-or-name (merge opts
-                                           {::source-table table
-                                            ::source-alias source-alias}
-                                           (when-let [position (clause->position &match)]
-                                             {::desired-alias desired-alias
-                                              ::position      position}))]
-          #_(println "(pr-str <>):" (pr-str <>)) ; NOCOMMIT
-          ))
+        [:field id-or-name (merge opts
+                                  {::source-table table
+                                   ::source-alias source-alias}
+                                  (when-let [position (clause->position &match)]
+                                    {::desired-alias (position->alias position desired-alias)
+                                     ::position      position}))])
 
       [:aggregation index & more]
       (let [position (clause->position &match)
@@ -147,7 +150,7 @@
                            :query  inner-query})))
         (let [[_ ag-name _] (nth aggregations index)]
           [:aggregation index (merge opts
-                                     {::desired-alias ag-name
+                                     {::desired-alias (position->alias position ag-name)
                                       ::position      position})]))
 
       [:expression expression-name & more]
@@ -155,7 +158,7 @@
             [opts]   more]
         (assert position (format "Expression with name %s does not exist at this level" (pr-str expression-name)))
         [:expression expression-name (merge opts
-                                            {::desired-alias expression-name
+                                            {::desired-alias (position->alias position expression-name)
                                              ::position      position})]))))
 
 ;; TODO -- we should add alias info to the aggregation clauses too
@@ -169,11 +172,3 @@
        (add-alias-info* form)
        form))
    query))
-
-(defn uniquify-aliases
-  "Make sure the `::desired-alias` of all of every selected field reference is unique."
-  [inner-query]
-  ;; TODO
-  )
-
-;; TODO -- raise query

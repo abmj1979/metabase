@@ -236,10 +236,9 @@
 (s/defn ^:private field-filter->replacement-snippet-info :- ParamSnippetInfo
   "Return `[replacement-snippet & prepared-statement-args]` appropriate for a field filter parameter."
   [driver {{param-type :type, value :value, :as params} :value, field :field, :as _field-filter}]
-  (let [prepend-field
-        (fn [x]
-          (update x :replacement-snippet
-                  (partial str (field->identifier driver field param-type) " ")))]
+  (let [prepend-field (fn [x]
+                        (update x :replacement-snippet
+                                (partial str (field->identifier driver field param-type) " ")))]
     (cond
       (ops/operator? param-type)
       (let [[snippet & args]

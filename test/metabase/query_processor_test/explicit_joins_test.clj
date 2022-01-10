@@ -508,12 +508,12 @@
                                 $longitude
                                 $price
                                 [:expression "RelativePrice"]]
-                  :expressions {:RelativePrice [:/ $price &CategoriesStats.*AvgPrice/Integer]},
+                  :expressions {:RelativePrice [:/ $price &CategoriesStats.*AvgPrice/Integer]}
                   :joins       [{:condition    [:= $category_id &CategoriesStats.venues.category_id]
                                  :source-query {:source-table $$venues
                                                 :aggregation  [[:aggregation-options [:max $price] {:name "MaxPrice"}]
                                                                [:aggregation-options [:avg $price] {:name "AvgPrice"}]
-                                                               [:aggregation-options [:min $price] {:name "MinPrice"}]],
+                                                               [:aggregation-options [:min $price] {:name "MinPrice"}]]
                                                 :breakout     [$category_id]}
                                  :alias        "CategoriesStats"
                                  :fields       :all}]

@@ -187,13 +187,13 @@
 (deftest sql-source-query-breakout-aggregation-test
   (mt/test-drivers (mt/normal-drivers-with-feature :nested-queries)
     (testing "make sure we can do a query with breakout and aggregation using a SQL source query"
-      (is (= (breakout-results)
-             (qp.test/rows-and-cols
-               (mt/format-rows-by [int int]
-                 (mt/run-mbql-query venues
-                   {:source-query {:native (:query (qp/query->native (mt/mbql-query venues)))}
-                    :aggregation  [:count]
-                    :breakout     [$price]}))))))))
+      (is (= (:rows (breakout-results))
+             (mt/rows
+              (mt/format-rows-by [int int]
+                (mt/run-mbql-query venues
+                  {:source-query {:native (:query (qp/query->native (mt/mbql-query venues)))}
+                   :aggregation  [:count]
+                   :breakout     [*price]}))))))))
 
 
 (defn- mbql-card-def

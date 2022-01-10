@@ -1,9 +1,10 @@
 (ns metabase.query-processor.util.add-alias-info-test
-  (:require [metabase.query-processor.util.add-alias-info :as add]
-            [clojure.test :refer :all]
+  (:require [clojure.test :refer :all]
+            [clojure.walk :as walk]
             [metabase.query-processor :as qp]
-            [metabase.test :as mt]
-            [clojure.walk :as walk]))
+            [metabase.query-processor.middleware.fix-bad-references :as fix-bad-refs]
+            [metabase.query-processor.util.add-alias-info :as add]
+            [metabase.test :as mt]))
 
 (defn- remove-source-metadata [x]
   (walk/postwalk
@@ -136,3 +137,119 @@
                                                                    :condition    [:= $reviews.product_id &P2.products.id]
                                                                    :alias        "P2"}]}}]
                     :limit        1}))))))
+
+(deftest uniquify-aliases-test
+  (mt/dataset sample-dataset
+    (is (query= (mt/mbql-query products
+                  {:source-table $$products
+                   :expressions  {:CATEGORY [:concat
+                                             [:field %category
+                                              {::add/source-table  $$products
+                                               ::add/source-alias  "CATEGORY"
+                                               ::add/desired-alias "CATEGORY"
+                                               ::add/position      0}]
+                                             "2"]}
+                   :fields       [[:field %category {::add/source-table  $$products
+                                                     ::add/source-alias  "CATEGORY"
+                                                     ::add/desired-alias "CATEGORY"
+                                                     ::add/position      0}]
+                                  [:expression "CATEGORY" {::add/desired-alias "CATEGORY_2"
+                                                           ::add/position      1}]]
+                   :limit        1})
+                (add-alias-info
+                 (mt/mbql-query products
+                   {:expressions {:CATEGORY [:concat [:field %category nil] "2"]}
+                    :fields      [[:field %category nil]
+                                  [:expression "CATEGORY"]]
+                    :limit       1}))))))
+
+(deftest not-null-test
+  (is (query= (mt/mbql-query checkins
+                {:aggregation [[:aggregation-options [:count] {:name "count"}]]
+                 :filter      [:!=
+                               [:field %date {:temporal-unit     :default
+                                              ::add/source-table $$checkins
+                                              ::add/source-alias "DATE"}]
+                               [:value nil {:base_type         :type/Date
+                                            :effective_type    :type/Date
+                                            :coercion_strategy nil
+                                            :semantic_type     nil
+                                            :database_type     "DATE"
+                                            :name              "DATE"
+                                            :unit              :default}]]})
+              (add-alias-info
+               (mt/mbql-query checkins
+                 {:aggregation [[:count]]
+                  :filter      [:not-null $date]})))))
+
+(deftest join-source-query-join-test
+  (with-redefs [fix-bad-refs/fix-bad-references identity]
+    (mt/dataset sample-dataset
+      (is (query= (mt/mbql-query orders
+                    {:joins  [{:source-query {:source-table $$reviews
+                                              :aggregation  [[:aggregation-options
+                                                              [:avg [:field %reviews.rating {::add/source-table $$reviews
+                                                                                             ::add/source-alias "RATING"}]]
+                                                              {:name "avg"}]]
+                                              :breakout     [[:field %products.category {:join-alias         "P2"
+                                                                                         ::add/source-table  "P2"
+                                                                                         ::add/source-alias  "CATEGORY"
+                                                                                         ::add/desired-alias "P2__CATEGORY"
+                                                                                         ::add/position      0}]]
+                                              :order-by     [[:asc [:field %products.category {:join-alias         "P2"
+                                                                                               ::add/source-table  "P2"
+                                                                                               ::add/source-alias  "CATEGORY"
+                                                                                               ::add/desired-alias "P2__CATEGORY"
+                                                                                               ::add/position      0}]]]
+                                              :joins        [{:strategy     :left-join
+                                                              :source-table $$products
+                                                              :condition    [:=
+                                                                             [:field %reviews.product_id {::add/source-table $$reviews
+                                                                                                          ::add/source-alias "PRODUCT_ID"}]
+                                                                             [:field %products.id {:join-alias        "P2"
+                                                                                                   ::add/source-table "P2"
+                                                                                                   ::add/source-alias "ID"}]]
+                                                              :alias        "P2"}]}
+                               :alias        "Q2"
+                               :strategy     :left-join
+                               :condition    [:=
+                                              [:field %products.category {::add/source-table ::add/source
+                                                                          ::add/source-alias "CATEGORY"}]
+                                              [:field %products.category {:join-alias         "Q2"
+                                                                          ::add/source-table  "Q2"
+                                                                          ::add/source-alias  "P2__CATEGORY"
+                                                                          ::add/desired-alias "Q2__P2__CATEGORY"
+                                                                          ::add/position      1}]]}]
+                     :fields [[:field "count" {:base-type          :type/BigInteger
+                                               ::add/source-table  ::add/source
+                                               ::add/source-alias  "count"
+                                               ::add/desired-alias "count"
+                                               ::add/position      0}]
+                              [:field %products.category {:join-alias         "Q2"
+                                                          ::add/source-table  "Q2"
+                                                          ::add/source-alias  "P2__CATEGORY"
+                                                          ::add/desired-alias "Q2__P2__CATEGORY"
+                                                          ::add/position      1}]
+                              [:field "avg" {:base-type          :type/Integer
+                                             :join-alias         "Q2"
+                                             ::add/source-table  "Q2"
+                                             ::add/source-alias  "avg"
+                                             ::add/desired-alias "Q2__avg"
+                                             ::add/position      2}]]
+                     :limit  2})
+                  (add-alias-info
+                   (mt/mbql-query orders
+                     {:fields [[:field "count" {:base-type :type/BigInteger}]
+                                     &Q2.products.category
+                               [:field "avg" {:base-type :type/Integer, :join-alias "Q2"}]]
+                      :joins  [{:strategy     :left-join
+                                :condition    [:= $products.category &Q2.products.category]
+                                :alias        "Q2"
+                                :source-query {:source-table $$reviews
+                                               :aggregation  [[:aggregation-options [:avg $reviews.rating] {:name "avg"}]]
+                                               :breakout     [&P2.products.category]
+                                               :joins        [{:strategy     :left-join
+                                                               :source-table $$products
+                                                               :condition    [:= $reviews.product_id &P2.products.id]
+                                                               :alias        "P2"}]}}]
+                      :limit  2})))))))
