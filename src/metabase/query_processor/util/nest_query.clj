@@ -6,14 +6,23 @@
    (This namespace is here rather than in the shared MBQL lib because it relies on other QP-land utils like the QP
   refs stuff.)"
   (:require [metabase.mbql.util :as mbql.u]
+            [metabase.plugins.classloader :as classloader]
+            [metabase.query-processor.error-type :as qp.error-type]
+            [metabase.query-processor.middleware.annotate :as annotate]
             [metabase.query-processor.store :as qp.store]
-            [metabase.query-processor.util.references :as refs]
+            [metabase.query-processor.util.add-alias-info :as add]
             [metabase.util :as u]
-            [metabase.plugins.classloader :as classloader]))
+            [metabase.util.i18n :refer [tru]]))
 
-(defn- ensure-refs [{:qp/keys [refs], :as query}]
-  (cond-> query
-    (not refs) refs/add-references))
+(defn- joined-fields [inner-query]
+  (into #{} (mbql.u/match (dissoc inner-query :source-query :source-metadata)
+              [:field _ (_ :guard :join-alias)]
+              &match)))
+
+(defn- add-joined-fields-to-fields [joined-fields source]
+  (cond-> source
+    (seq joined-fields) (update :fields (fn [fields]
+                                          (distinct (concat fields joined-fields))))))
 
 (defn- nest-source [inner-query]
   (classloader/require 'metabase.query-processor)
@@ -22,15 +31,28 @@
                                                                            :type     :query
                                                                            :query    source})
                  (:query source)
-                 (dissoc source :limit))]
+                 (dissoc source :limit)
+                 (add-joined-fields-to-fields (joined-fields inner-query) source))]
     (-> inner-query
         (dissoc :source-table :source-metadata :joins)
         (assoc :source-query source))))
 
+(defn- raise-source-query-expression-ref
+  "Convert an `:expression` reference from a source query into an appropriate `:field` clause for use in the surrounding
+  query."
+  [{:keys [expressions], :as source-query} [_ expression-name opts]]
+  (let [expression-definition (or (get expressions (keyword expression-name))
+                                  (throw (ex-info (tru "No expression named {0}" (pr-str expression-name))
+                                                  {:type            qp.error-type/invalid-query
+                                                   :expression-name expression-name
+                                                   :query           source-query})))
+        {base-type :base_type} (some-> expression-definition annotate/infer-expression-type)]
+    [:field expression-name (assoc opts :base-type (or base-type :type/*))]))
+
 (defn- rewrite-fields-and-expressions [query]
   (mbql.u/replace query
-    [:expression expression-name]
-    (refs/raise-source-query-field-or-ref query &match)
+    :expression
+    (raise-source-query-expression-ref query &match)
 
     ;; mark all Fields at the new top level as `::outer-select` so QP implementations know not to apply coercion or
     ;; whatever to them a second time.
@@ -58,20 +80,6 @@
           rewrite-fields-and-expressions
           (assoc :source-query source-query)))))
 
-#_(defn- raise-join-info [])
-
-#_(defn- update-join-ref-info [refs]
-  (into
-   {}
-   (fn [[clause info]]
-     [clause (mbql.u/match-one clause
-               [:field _id-or-name (_opts :guard :join-alias)]
-               (raise-join-info info)
-
-               _
-               info)])
-   refs))
-
 (defn nest-expressions
   "Pushes the `:source-table`/`:source-query`, `:expressions`, and `:joins` in the top-level of the query into a
   `:source-query` and updates `:expression` references and `:field` clauses with `:join-alias`es accordingly. See
@@ -79,15 +87,10 @@
   [{:keys [expressions], :as query}]
   (if (empty? expressions)
     query
-    (let [query                               (-> query
-                                                  ensure-refs
-                                                  rewrite-fields-and-expressions)
-          {:keys [source-query], :as query}   (nest-source query)
-          source-query                        (assoc source-query :expressions expressions)
-          {:qp/keys [refs], :as source-query} (refs/add-references source-query)]
+    (let [query                             (rewrite-fields-and-expressions query)
+          {:keys [source-query], :as query} (nest-source query)
+          source-query                      (assoc source-query :expressions expressions)]
       (-> query
           (dissoc :source-query :expressions)
           (assoc :source-query source-query)
-          ;; update references.
-          refs/add-references
-          #_(update :qp/refs update-join-ref-info)))))
+          add/add-alias-info))))

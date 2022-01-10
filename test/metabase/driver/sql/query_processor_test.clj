@@ -11,13 +11,8 @@
             [metabase.query-processor.interface :as qp.i]
             [metabase.test :as mt]
             [metabase.util.honeysql-extensions :as hx]
-            [schema.core :as s]))
-
-(deftest field-ref-info-test
-  (testing "field-ref-info should ignore namespaced options added by various driver QP methods"
-    (binding [sql.qp/*query* {:qp/refs {[:field 1 nil] {:alias "wow"}}}]
-      (is (= {:alias "wow"}
-             (#'sql.qp/field-ref-info [:field 1 {::crazy-option 1000}]))))))
+            [schema.core :as s]
+            [metabase.query-processor.util.add-alias-info :as add]))
 
 (deftest process-mbql-query-keys-test
   (testing "make sure our logic for deciding which order to process keys in the query works as expected"
@@ -154,25 +149,36 @@
                  (hx/identifier :table-alias "card")]
                 [:=
                  (hx/with-database-type-info (hx/identifier :field "PUBLIC" "CHECKINS" "VENUE_ID") "integer")
-                 (hx/identifier :field "id")]]
+                 (hx/identifier :field "card" "id")]]
                (sql.qp/join->honeysql :h2
                                       (mt/$ids checkins
-                                               {:source-query {:native "SELECT * FROM VENUES;", :params []}
-                                                :alias        "card"
-                                                :strategy     :left-join
-                                                :condition    [:= $venue_id &card.*id/Integer]}))))))))
+                                        {:source-query {:native "SELECT * FROM VENUES;", :params []}
+                                         :alias        "card"
+                                         :strategy     :left-join
+                                         :condition    [:=
+                                                        [:field %venue_id {::add/source-table $$checkins
+                                                                           ::add/source-alias "VENUE_ID"}]
+                                                        [:field "id" {:join-alias        "card"
+                                                                      :base-type         :type/Integer
+                                                                      ::add/source-table "card"
+                                                                      ::add/source-alias "id"}]]}))))))))
 
 (deftest compile-honeysql-test
   (testing "make sure the generated HoneySQL will compile to the correct SQL"
-    (is (= ["INNER JOIN (SELECT * FROM VENUES) card ON PUBLIC.CHECKINS.VENUE_ID = id"]
+    (is (= ["INNER JOIN (SELECT * FROM VENUES) card ON PUBLIC.CHECKINS.VENUE_ID = card.id"]
            (hsql/format {:join (mt/with-everything-store
                                  (driver/with-driver :h2
                                    (sql.qp/join->honeysql :h2
-                                     (mt/$ids checkins
-                                       {:source-query {:native "SELECT * FROM VENUES;", :params []}
-                                        :alias        "card"
-                                        :strategy     :left-join
-                                        :condition    [:= $venue_id &card.*id/Integer]}))))})))))
+                                                          (mt/$ids checkins
+                                                            {:source-query {:native "SELECT * FROM VENUES;", :params []}
+                                                             :alias        "card"
+                                                             :strategy     :left-join
+                                                             :condition    [:=
+                                                                            [:field %venue_id {::add/source-table $$checkins
+                                                                                               ::add/source-alias "VENUE_ID"}]
+                                                                            [:field "id" {:base-type         :type/Text
+                                                                                          ::add/source-table "card"
+                                                                                          ::add/source-alias "id"}]]}))))})))))
 
 (deftest adjust-start-of-week-test
   (driver/with-driver :h2
@@ -322,14 +328,14 @@
 (deftest multiple-joins-with-expressions-test
   (testing "We should be able to compile a complicated query with multiple joins and expressions correctly"
     (mt/dataset sample-dataset
-      ;; SELECT source.PRODUCTS__via__PRODUCT_ID__CATEGORY AS PRODUCTS__via__PRODUCT_ID__CATEGORY,
-      ;;  source.PEOPLE__via__USER_ID__SOURCE AS PEOPLE__via__USER_ID__SOURCE,
-      ;;  parsedatetime(year(source.CREATED_AT), 'yyyy') AS CREATED_AT,
+      ;; SELECT source.PRODUCTS__via__PRODUCT_ID__CATEGORY AS PRODUCTS__via__PRODUCT_ID__CATEGORY
+      ;;  source.PEOPLE__via__USER_ID__SOURCE AS PEOPLE__via__USER_ID__SOURCE
+      ;;  parsedatetime(year(source.CREATED_AT), 'yyyy') AS CREATED_AT
       ;;  source."pivot-grouping" AS "pivot-grouping", count(*) AS count
       ;; FROM (
-      ;; SELECT PRODUCTS__via__PRODUCT_ID.CATEGORY AS PRODUCTS__via__PRODUCT_ID__CATEGORY,
-      ;;  PEOPLE__via__USER_ID.SOURCE AS PEOPLE__via__USER_ID__SOURCE,
-      ;;  ORDERS.CREATED_AT AS CREATED_AT,
+      ;; SELECT PRODUCTS__via__PRODUCT_ID.CATEGORY AS PRODUCTS__via__PRODUCT_ID__CATEGORY
+      ;;  PEOPLE__via__USER_ID.SOURCE AS PEOPLE__via__USER_ID__SOURCE
+      ;;  ORDERS.CREATED_AT AS CREATED_AT
       ;;  abs(0) AS "pivot-grouping"
       ;; FROM ORDERS
       ;;  LEFT JOIN PRODUCTS PRODUCTS__via__PRODUCT_ID
@@ -342,24 +348,33 @@
       ;;  OR source.PRODUCTS__via__PRODUCT_ID__CATEGORY = ?)
       ;;  AND source.CREATED_AT >= parsedatetime(year(dateadd('year', CAST(-2 AS long), now())), 'yyyy')
       ;;  AND source.CREATED_AT < parsedatetime(year(now()), 'yyyy'))
-      ;; GROUP BY source.PRODUCTS__via__PRODUCT_ID__CATEGORY,
-      ;;  source.PEOPLE__via__USER_ID__SOURCE,
-      ;;  parsedatetime(year(source.CREATED_AT), 'yyyy'),
+      ;; GROUP BY source.PRODUCTS__via__PRODUCT_ID__CATEGORY
+      ;;  source.PEOPLE__via__USER_ID__SOURCE
+      ;;  parsedatetime(year(source.CREATED_AT), 'yyyy')
       ;;  source."pivot-grouping"
-      ;; ORDER BY source.PRODUCTS__via__PRODUCT_ID__CATEGORY ASC,
-      ;;  source.PEOPLE__via__USER_ID__SOURCE ASC,
-      ;;  parsedatetime(year(source.CREATED_AT), 'yyyy') ASC,
+      ;; ORDER BY source.PRODUCTS__via__PRODUCT_ID__CATEGORY ASC
+      ;;  source.PEOPLE__via__USER_ID__SOURCE ASC
+      ;;  parsedatetime(year(source.CREATED_AT), 'yyyy') ASC
       ;;  source."pivot-grouping" ASC
       (is (= '{:select   [source.PRODUCTS__via__PRODUCT_ID__CATEGORY AS PRODUCTS__via__PRODUCT_ID__CATEGORY
                           source.PEOPLE__via__USER_ID__SOURCE AS PEOPLE__via__USER_ID__SOURCE
                           parsedatetime (year (source.CREATED_AT) "yyyy") AS CREATED_AT
                           source.pivot-grouping AS pivot-grouping
                           count (*) AS count]
-               :from     [{:select
-                           [PRODUCTS__via__PRODUCT_ID.CATEGORY AS PRODUCTS__via__PRODUCT_ID__CATEGORY
-                            PEOPLE__via__USER_ID.SOURCE AS PEOPLE__via__USER_ID__SOURCE
-                            ORDERS.CREATED_AT AS CREATED_AT
-                            abs (0) AS pivot-grouping]
+               :from     [{:select    [ORDERS.ID                          AS ID
+                                       ORDERS.USER_ID                     AS USER_ID
+                                       ORDERS.PRODUCT_ID                  AS PRODUCT_ID
+                                       ORDERS.SUBTOTAL                    AS SUBTOTAL
+                                       ORDERS.TAX                         AS TAX
+                                       ORDERS.TOTAL                       AS TOTAL
+                                       ORDERS.DISCOUNT                    AS DISCOUNT
+                                       ORDERS.CREATED_AT                  AS CREATED_AT
+                                       ORDERS.QUANTITY                    AS QUANTITY
+                                       abs (0)                            AS pivot-grouping
+                                       PEOPLE__via__USER_ID.ID            AS PEOPLE__via__USER_ID__ID
+                                       PRODUCTS__via__PRODUCT_ID.CATEGORY AS PRODUCTS__via__PRODUCT_ID__CATEGORY
+                                       PEOPLE__via__USER_ID.SOURCE        AS PEOPLE__via__USER_ID__SOURCE
+                                       PRODUCTS__via__PRODUCT_ID.ID       AS PRODUCTS__via__PRODUCT_ID__ID]
                            :from      [ORDERS]
                            :left-join [PRODUCTS PRODUCTS__via__PRODUCT_ID
                                        ON ORDERS.PRODUCT_ID = PRODUCTS__via__PRODUCT_ID.ID
@@ -639,6 +654,35 @@
                 :limit        2})
              mbql->native
              sql.qp-test-util/sql->sql-map))))
+
+(deftest expression-with-duplicate-column-name-test
+  (mt/test-drivers (mt/normal-drivers-with-feature :expressions)
+    (testing "Can we use expression with same column name as table (#14267)"
+      (mt/dataset sample-dataset
+        (is (= '{:select   [source.CATEGORY AS CATEGORY_2
+                            count (*)       AS count]
+                 :from     [{:select [PRODUCTS.ID                  AS ID
+                                      PRODUCTS.EAN                 AS EAN
+                                      PRODUCTS.TITLE               AS TITLE
+                                      PRODUCTS.CATEGORY            AS CATEGORY
+                                      PRODUCTS.VENDOR              AS VENDOR
+                                      PRODUCTS.PRICE               AS PRICE
+                                      PRODUCTS.RATING              AS RATING
+                                      PRODUCTS.CREATED_AT          AS CREATED_AT
+                                      concat (PRODUCTS.CATEGORY ?) AS CATEGORY_2]
+                             :from   [PRODUCTS]}
+                            source]
+                 :group-by [source.CATEGORY_2]
+                 :order-by [source.CATEGORY_2 ASC]
+                 :limit    [1]}
+               (-> (mt/mbql-query products
+                     {:expressions {:CATEGORY [:concat $category "2"]}
+                      :breakout    [:expression :CATEGORY]
+                      :aggregation [:count]
+                      :order-by    [[:asc [:expression :CATEGORY]]]
+                      :limit       1})
+                   mbql->native
+                   sql.qp-test-util/sql->sql-map)))))))
 
 (deftest mega-query-test
   (testing "Should generate correct SQL for joins against source queries that contain joins (#12928)"

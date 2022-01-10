@@ -1,33 +1,35 @@
 (ns metabase.driver.sql.query-processor
   "The Query Processor is responsible for translating the Metabase Query Language into HoneySQL SQL forms."
-  (:require [clojure.core.match :refer [match]]
-            [clojure.string :as str]
-            [clojure.tools.logging :as log]
-            [honeysql.core :as hsql]
-            [honeysql.format :as hformat]
-            [honeysql.helpers :as h]
-            [metabase.driver :as driver]
-            [metabase.driver.common :as driver.common]
-            [metabase.mbql.schema :as mbql.s]
-            [metabase.mbql.util :as mbql.u]
-            [metabase.query-processor.util.add-alias-info :as add]
-            [metabase.models.field :as field :refer [Field]]
-            [metabase.models.table :refer [Table]]
-            [metabase.query-processor.error-type :as qp.error-type]
-            [metabase.query-processor.interface :as i]
-            [metabase.query-processor.middleware.annotate :as annotate]
-            [metabase.query-processor.middleware.wrap-value-literals :as value-literal]
-            [metabase.query-processor.store :as qp.store]
-            [metabase.query-processor.util.nest-query :as nest-query]
-            [metabase.query-processor.util.references :as refs]
-            [metabase.util :as u]
-            [metabase.util.honeysql-extensions :as hx]
-            [metabase.util.i18n :refer [deferred-tru tru]]
-            [potemkin.types :as p.types]
-            [pretty.core :refer [PrettyPrintable]]
-            [schema.core :as s])
-  (:import metabase.models.field.FieldInstance
-           [metabase.util.honeysql_extensions Identifier TypedHoneySQLForm]))
+  (:require
+   [clojure.core.match :refer [match]]
+   [clojure.string :as str]
+   [clojure.tools.logging :as log]
+   [honeysql.core :as hsql]
+   [honeysql.format :as hformat]
+   [honeysql.helpers :as h]
+   [metabase.driver :as driver]
+   [metabase.driver.common :as driver.common]
+   [metabase.mbql.schema :as mbql.s]
+   [metabase.mbql.util :as mbql.u]
+   [metabase.models.field :as field :refer [Field]]
+   [metabase.models.table :refer [Table]]
+   [metabase.query-processor.error-type :as qp.error-type]
+   [metabase.query-processor.interface :as i]
+   [metabase.query-processor.middleware.annotate :as annotate]
+   [metabase.query-processor.middleware.wrap-value-literals
+    :as value-literal]
+   [metabase.query-processor.store :as qp.store]
+   [metabase.query-processor.util.add-alias-info :as add]
+   [metabase.query-processor.util.nest-query :as nest-query]
+   [metabase.util :as u]
+   [metabase.util.honeysql-extensions :as hx]
+   [metabase.util.i18n :refer [deferred-tru tru]]
+   [potemkin.types :as p.types]
+   [pretty.core :refer [PrettyPrintable]]
+   [schema.core :as s])
+  (:import
+   (metabase.models.field FieldInstance)
+   (metabase.util.honeysql_extensions Identifier TypedHoneySQLForm)))
 
 (def source-query-alias
   "Alias to use for source queries, e.g.:
@@ -294,8 +296,16 @@
 (defmethod ->honeysql [:sql :value] [driver [_ value]] (->honeysql driver value))
 
 (defmethod ->honeysql [:sql :expression]
-  [driver [_ expression-name]]
-  (->honeysql driver (mbql.u/expression-with-name *query* expression-name)))
+  [driver [_ expression-name {::add/keys [source-table source-alias]} :as clause]]
+  #_(println "(pr-str clause):" (pr-str clause)) ; NOCOMMIT
+  (when-not (get-in *query* [:expressions (keyword expression-name)])
+    (throw (ex-info (tru "No expression named {0} at this level of the query" (pr-str expression-name))
+                    {:type       qp.error-type/invalid-query
+                     :expression clause
+                     :query      *query*})))
+  (->honeysql driver (if (= source-table ::add/source)
+                       (apply hx/identifier :field source-query-alias source-alias)
+                       (mbql.u/expression-with-name *query* expression-name))))
 
 (defn semantic-type->unix-timestamp-unit
   "Translates coercion types like `:Coercion/UNIXSeconds->DateTime` to the corresponding unit of time to use in
@@ -312,21 +322,21 @@
 
 (defn cast-field-if-needed
   "Wrap a `field-identifier` in appropriate HoneySQL expressions if it refers to a UNIX timestamp Field."
-  [driver field field-identifier]
+  [driver field expression]
   (match [(:base_type field) (:coercion_strategy field) (::nest-query/outer-select field)]
-    [_ _ true] field-identifier ;; casting happens inside the inner query
+    [_ _ true] expression ;; casting happens inside the inner query
 
     [(:isa? :type/Number)   (:isa? :Coercion/UNIXTime->Temporal) _]
     (unix-timestamp->honeysql driver
                               (semantic-type->unix-timestamp-unit (:coercion_strategy field))
-                              field-identifier)
+                              expression)
 
     [:type/Text             (:isa? :Coercion/String->Temporal)   _]
-    (cast-temporal-string driver (:coercion_strategy field) field-identifier)
+    (cast-temporal-string driver (:coercion_strategy field) expression)
     [(:isa? :type/*)        (:isa? :Coercion/Bytes->Temporal)    _]
-    (cast-temporal-byte driver (:coercion_strategy field) field-identifier)
+    (cast-temporal-byte driver (:coercion_strategy field) expression)
 
-    :else field-identifier))
+    :else expression))
 
 (defmethod ->honeysql [:sql TypedHoneySQLForm]
   [driver typed-form]
@@ -337,7 +347,6 @@
   [_ identifier]
   identifier)
 
-;; TODO -- duplicated with [[metabase.query-processor.middleware.refs.alias/prefix-field-alias]]
 (defmulti prefix-field-alias
   "Create a Field alias by combining a `prefix` string with `field-alias` string (itself is the result of the
   [[field->alias]] method). The default implementation just joins the two strings with `__` -- override this if you need
@@ -352,22 +361,6 @@
 (defmethod prefix-field-alias :sql
   [_ prefix field-alias]
   (str prefix "__" field-alias))
-
-(defmethod ->honeysql [:sql (class Field)]
-  [driver {field-name    :name
-           table-id      :table_id
-           database-type :database_type
-           ::keys        [source-alias table-alias options]
-           :as           field}]
-  ;; [[hx/identifer]] will automatically unnest nested calls to [[hx/identifier]]
-  (as-> (if table-alias
-          [table-alias (or source-alias field-name)]
-          (let [{schema :schema, table-name :name} (qp.store/table table-id)]
-            [schema table-name field-name])) expr
-    (apply hx/identifier :field expr)
-    (->honeysql driver expr)
-    (cast-field-if-needed driver field expr)
-    (hx/with-database-type-info expr database-type)))
 
 (defn apply-temporal-bucketing
   "Apply temporal bucketing for the `:temporal-unit` in the options of a `:field` clause; return a new HoneySQL form that
@@ -392,20 +385,28 @@
       (hx/+ min-value)))
 
 (defmethod ->honeysql [:sql :field]
-  [driver [_ id-or-name {:keys [database-type], ::add/keys [source-table source-alias desired-alias], :as options} :as field-clause]]
+  [driver [_ id-or-name {:keys             [database-type]
+                         ::add/keys        [source-table source-alias]
+                         ::nest-query/keys [outer-select]
+                         :as               options}
+           :as field-clause]]
+  #_(println "field-clause:" (pr-str field-clause)) ; NOCOMMIT
   (try
     (let [table-alias (cond
-                        (= source-table ::add/source) source-query-alias
-                        (integer? source-table)       (:name (qp.store/table source-table))
-                        :else                         source-table)]
+                        (= source-table ::add/source) [source-query-alias]
+                        (integer? source-table)       (let [{schema :schema, table-name :name} (qp.store/table source-table)]
+                                                        [schema table-name])
+                        :else                         [source-table])]
       (binding [*field-options* options
                 *table-alias*   table-alias]
         (let [field         (when (integer? id-or-name)
                               (qp.store/field id-or-name))
               database-type (or database-type
                                 (:database_type field))
-              honeysql-form (cond-> (->honeysql driver (hx/identifier :field table-alias source-alias))
-                              database-type (hx/with-database-type-info database-type))]
+              honeysql-form (cond-> (->honeysql driver (apply hx/identifier :field (concat table-alias [source-alias])))
+                              (and field
+                                   (not outer-select)) ((partial cast-field-if-needed driver field))
+                              database-type            (hx/with-database-type-info database-type))]
           (cond->> honeysql-form
             (:temporal-unit options) (apply-temporal-bucketing driver options)
             (:binning options)       (apply-binning options)))))
@@ -596,13 +597,14 @@
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
 (defn field-clause->alias
-  "DEPRECATED IN 0.42.0: You should NOT need to use this function directly. Use [[as]] instead."
+  "DEPRECATED IN 0.42.0: You do not need to use this function directly. You can use
+  `::metabase.query-processor.util.add-alias-info/desired-alias` in the clause options instead."
   {:deprecated "0.42.0"}
-  [_driver field-clause & _]
-  (:alias (field-ref-info field-clause)))
+  [_driver [_ _ {::add/keys [desired-alias]} :as clause] & _]
+  desired-alias)
 
 (defn as
-  "Generate HoneySQL for an `AS` form (e.g. `<form> AS <field>`) using the name information of a `field-clause`. The
+  "Generate HoneySQL for an `AS` form (e.g. `<form> AS <field>`) using the name information of a `clause`. The
   HoneySQL representation of on `AS` clause is a tuple like `[<form> <alias>]`.
 
   In some cases where the alias would be redundant, such as plain field literals, this returns the form as-is.
@@ -614,10 +616,8 @@
     (as [:field \"x\" {:base-type :type/Text, :temporal-unit :month}])
     ;; -> [<compiled-form> :x]
     ;; -> SELECT date_extract(\"x\", 'month') AS \"x\""
-  [driver field-clause & _unique-name-fn]
-  (let [honeysql-form (->honeysql driver field-clause)
-        ref-info      (field-ref-info field-clause)
-        desired-alias (:alias ref-info)]
+  [driver [_ _ {::add/keys [desired-alias]} :as clause] & _unique-name-fn]
+  (let [honeysql-form (->honeysql driver clause)]
     (if desired-alias
       [honeysql-form desired-alias]
       honeysql-form)))
@@ -963,8 +963,10 @@
 (defn mbql->honeysql
   "Build the HoneySQL form we will compile to SQL and execute."
   [driver {inner-query :query}]
-  (let [inner-query (add/add-alias-info inner-query)]
-    (u/prog1 (apply-clauses driver {} (preprocess-query driver inner-query))
+  (let [query (->> (add/add-alias-info inner-query)
+                   (preprocess-query driver))]
+    #_(println "(u/pprint-to-str 'green query):" (u/pprint-to-str 'green query)) ; NOCOMMIT
+    (u/prog1 (apply-clauses driver {} query)
       (when-not i/*disable-qp-logging*
         (log/tracef "\nHoneySQL Form: %s\n%s" (u/emoji "🍯") (u/pprint-to-str 'cyan <>))))))
 
